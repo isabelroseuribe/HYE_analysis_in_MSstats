@@ -1,0 +1,890 @@
+---
+title: "PAMAF mode analysis of 1000ng HYE"
+author: "Isabel Uribe"
+date: "2025-12-05"
+output: html_document
+---
+
+################################################################################
+Process data with MSstats
+################################################################################
+
+Read in data with MSstats and store id info.
+```{r}
+library(tidyverse)
+library(MSstatsConvert)
+
+msstats_col = c("R.Condition", "R.FileName", "R.Replicate", "PG.Organisms",
+                "PG.ProteinAccessions", "PG.ProteinGroups", "PG.ProteinNames", 
+                "PG.Qvalue", "PG.Quantity",
+                "PEP.GroupingKey", "PEP.StrippedSequence", "PEP.Quantity",
+                "EG.iRTPredicted", "EG.Library", "EG.ModifiedSequence", 
+                "EG.PrecursorId", "EG.Qvalue",
+                "FG.Charge", "FG.Id", "FG.PrecMz", 
+                "FG.Quantity", "FG.MS1RawQuantity",
+                "F.Charge", "F.FrgIon", "F.FrgLossType", "F.FrgMz",
+                "F.FrgNum", "F.FrgType", 
+                "F.ExcludedFromQuantification", "F.PeakArea")
+
+data = read_tsv("report-name.tsv") %>% 
+  select(all_of(msstats_col)) %>%
+  filter(F.FrgLossType == "noloss") %>%
+  #Collapse fragment-level (F.) data into precursor-level (FG.) data.
+  mutate(F.Charge = str_split_i(FG.Id, "_\\.", 2),
+         F.FrgIon = str_remove_all(FG.Id, "_"),
+         # F.FrgLossType = rep("noloss"),
+         F.FrgMz = FG.PrecMz,
+         F.FrgNum = FG.Id, 
+         F.FrgType = FG.Id,
+         F.ExcludedFromQuantification = rep(FALSE), #Keep all ids.
+         F.PeakArea = FG.MS1RawQuantity) %>% #Set quantity as FG.MS1 here.
+  distinct()
+
+#Read precursor-level data into MSstats format.
+data1 = SpectronauttoMSstatsFormat(data)
+```
+
+Read data into MSstats with F.NormalizedPeakArea (since dataProcess requires valid MSstats data). 
+Process data without normalization and with imputation.
+```{r}
+library(MSstats)
+
+msstats_summarized = dataProcess(data1, 
+                                 normalization=FALSE,
+                                 MBimpute=FALSE,
+                                 summaryMethod="TMP",
+                                 numberOfCores = 12)
+
+
+
+data_folder = "C:/Users/folder-name"
+
+save(msstats_summarized,
+      file=paste(data_folder, "2026may03_file_name.rda", sep="/"))
+
+# load(file = "2026may03_file_name.rda")
+
+rm(data1)
+```
+
+################################################################################
+Calculate additional details about PG identification.
+################################################################################
+
+Use feature level data to calculate # unique modified peptides and % sequence coverage for each protein.
+```{r}
+PRdata = msstats_summarized$FeatureLevelData %>%
+  mutate(PRECURSOR = PEPTIDE,
+         MOD_PEPTIDE = str_split_i(PEPTIDE, "_", 1),
+         Stripped.Sequence = str_replace_all(MOD_PEPTIDE, "(\\[.*?\\])", "")) %>%
+  select(PROTEIN, Stripped.Sequence, MOD_PEPTIDE, PRECURSOR, GROUP, SUBJECT, RUN, INTENSITY) %>%
+  filter(!is.na(INTENSITY))
+
+#Add organism column to feature level data frame.
+uniprot.H$organism = uniprot.H$PG.Organisms
+uniprot.H$PROTEIN = uniprot.H$PG.ProteinGroups
+uniprot.Y$organism = uniprot.Y$PG.Organisms
+uniprot.Y$PROTEIN = uniprot.Y$PG.ProteinGroups
+uniprot.E$organism = uniprot.E$PG.Organisms
+uniprot.E$PROTEIN = uniprot.E$PG.ProteinGroups
+
+PRdata.H = semi_join(PRdata, uniprot.H, by = "PROTEIN")
+PRdata.Y = semi_join(PRdata, uniprot.Y, by = "PROTEIN")
+PRdata.E = semi_join(PRdata, uniprot.E, by = "PROTEIN")
+
+PRdata.H$organism = rep("HELA", times = nrow(PRdata.H))
+PRdata.Y$organism = rep("YEAST", times = nrow(PRdata.Y))
+PRdata.E$organism = rep("E.COLI", times = nrow(PRdata.E))
+
+PRdata_2 = rbind(PRdata.E, PRdata.H, PRdata.Y)
+
+#For each PG, calculate the % protein sequence coverage and number of unique modified peptides.
+library(protti)
+library(data.table)
+
+#See last chunk of code to see how this csv file was created.
+HYE_prot = read.csv("HYE_protein_sequences.csv") %>% select(!X)
+
+PRdata_3 = PRdata_2 %>%
+  mutate(PG_id = PROTEIN) %>%
+  separate_rows(PROTEIN, sep = ";") %>%
+  left_join(HYE_prot, by = c("organism", "PROTEIN")) %>%
+  group_by(RUN, PROTEIN) %>%
+  calculate_sequence_coverage(Protein.Sequence, Stripped.Sequence) %>%
+  mutate(coverage = round(coverage, digits = 2)) %>%
+  group_by(PROTEIN, PG_id, GROUP, SUBJECT, RUN, organism, coverage) %>%
+  summarise(num_of_distinct_pep = n_distinct(MOD_PEPTIDE))
+
+PRdata_4 = PRdata_3 %>%
+  group_by(PROTEIN, PG_id, organism, GROUP) %>%
+  summarise(avg_num_mod_pep = round(mean(num_of_distinct_pep, na.rm = TRUE)),
+            avg_prot_seq_cov = round(mean(coverage, na.rm = TRUE), digits = 2)) %>%
+  group_by(PG_id, GROUP, organism) %>%
+  summarise(
+    across(c(PROTEIN, avg_num_mod_pep, avg_prot_seq_cov), ~ paste(unique(na.omit(.)), collapse = ";")),
+    .groups = "drop"
+  ) %>%
+  select(GROUP, PROTEIN, organism, avg_num_mod_pep, avg_prot_seq_cov) %>%
+  distinct()
+colnames(PRdata_4)[colnames(PRdata_4) == "PROTEIN"] = "Protein"
+
+rm(PRdata_3, PRdata.E, PRdata.H, PRdata.Y)
+```
+
+Add species information back to PGdata df.
+```{r}
+# load(file = '2026may03_file_name.rda')
+PGdata = msstats_summarized$ProteinLevelData
+
+#read in line 17 and 29 for "data" df here.
+uniprot.H = data %>% filter(str_detect(PG.Organisms, "Homo sapiens") & !str_detect(PG.Organisms, "Saccharomyces|Escherichia")) %>%
+  select(PG.Organisms, PG.ProteinGroups) %>% distinct()
+uniprot.Y = data %>% filter(str_detect(PG.Organisms, "Saccharomyces") & !str_detect(PG.Organisms, "Homo sapiens|Escherichia")) %>%
+  select(PG.Organisms, PG.ProteinGroups) %>% distinct()
+uniprot.E = data %>% filter(str_detect(PG.Organisms, "Escherichia") & !str_detect(PG.Organisms, "Homo sapiens|Saccharomyces")) %>%
+  select(PG.Organisms, PG.ProteinGroups) %>% distinct()
+
+#Create column to facilitate adding PG.Organisms back to PGdata.
+PGdata$PG.ProteinGroups = PGdata$Protein
+  
+PGdata.H = semi_join(PGdata, uniprot.H, by = "PG.ProteinGroups")
+PGdata.Y = semi_join(PGdata, uniprot.Y, by = "PG.ProteinGroups")
+PGdata.E = semi_join(PGdata, uniprot.E, by = "PG.ProteinGroups")
+
+#add column for plot later
+PGdata.H$organism = rep("HELA", times = nrow(PGdata.H))
+PGdata.Y$organism = rep("YEAST", times = nrow(PGdata.Y))
+PGdata.E$organism = rep("E.COLI", times = nrow(PGdata.E))
+
+PGdata_2 = rbind(PGdata.E, PGdata.H, PGdata.Y)
+
+rm(PGdata, PGdata.E, PGdata.H, PGdata.Y)
+```
+
+Calculate PG.CV and filter for ids with 4 reps for quant.
+```{r}
+#Define function for SD across a row.
+rowSDs <- function(x, num_of_measurements) {
+  sqrt(rowSums((x - rowMeans(x, na.rm = TRUE))^2, na.rm = TRUE)/(num_of_measurements - 1))
+}
+
+PGdata_3 = pivot_wider(PGdata_2, id_cols = c("Protein", "organism", "GROUP"), names_from = "SUBJECT", values_from = "LogIntensities") %>%
+  mutate(abundance_1 = 2^`1`,
+         abundance_2 = 2^`2`,
+         abundance_3 = 2^`3`, 
+         abundance_4 = 2^`4`,
+         num_of_measurements = rowSums(!is.na(across(c("1", "2", "3", "4"))))) %>%
+  #Calculate CV for abundance values (not log) of each PG (allows NA).
+  mutate(PG.CV = (rowSDs(across(c("abundance_1", "abundance_2", "abundance_3", "abundance_4")), num_of_measurements)/rowMeans(across(c("abundance_1", "abundance_2", "abundance_3", "abundance_4")), na.rm = TRUE))*100) 
+
+PGdata_3 = left_join(PGdata_3, PRdata_4, by = c("GROUP", "Protein", "organism")) %>%
+  mutate(use_for_plots = num_of_measurements == 4)
+
+rm(PGdata_2)
+
+PGdata_long = PGdata_3 %>% 
+  filter(use_for_plots) %>% #now will only plot PGs with complete data (4/4 reps)
+  select(Protein, organism, GROUP, num_of_measurements, PG.CV, contains("avg"), `1`, `2`, `3`, `4`) %>%
+  pivot_longer(cols = -c("Protein", "organism", "GROUP", "num_of_measurements",
+                                          "PG.CV", "avg_num_mod_pep", "avg_prot_seq_cov"), 
+                              names_to = "replicate", 
+                              values_to = "log2int")
+
+#write tsv file listing all PGs identified for supplemental table.
+#for error with "no Normalized_log2int", run next chunk of code first.
+normalized_int = pivot_wider(PGdata_long, id_cols = c("Protein", "organism", "GROUP"), names_from = "replicate", values_from = "Normalized_log2int")
+colnames(normalized_int) = c("Protein", "organism", "GROUP", "Normalized_log2int_1", "Normalized_log2int_2", "Normalized_log2int_3", "Normalized_log2int_4")
+
+supp_table_HYE = full_join(PGdata_3, normalized_int, by = c("Protein", "organism", "GROUP")) %>%
+  mutate(Normalized_abundance_1 = 2^Normalized_log2int_1,
+         Normalized_abundance_2 = 2^Normalized_log2int_2,
+         Normalized_abundance_3 = 2^Normalized_log2int_3, 
+         Normalized_abundance_4 = 2^Normalized_log2int_4) %>%
+  rename_with(~ paste0("log2int_", .x), .cols = c("1", "2", "3", "4"))
+  
+# write_tsv(supp_table_HYE, "1000ng_HYE_PAMAF-mode_PGids.tsv")
+```
+
+################################################################################
+PG-level data: Normalize w/ human data, calculate stats, and plot.
+################################################################################
+
+Calculate normalization for human data and apply to other proteomes.
+```{r}
+#See code chunk at line 134 to create this PGdata df.
+PGdata_long$FRACTION = rep(1, times = nrow(PGdata_long))
+
+data.H = PGdata_long %>% filter(organism == "HELA")
+
+#Calculate median of abundances grouped by run.
+runmedians = data.H %>% 
+  group_by(GROUP, replicate) %>%
+  summarise(median(log2int, na.rm = TRUE))
+colnames(runmedians) = c("GROUP", "replicate", "median_abundance_run")
+
+#Calculate median of abundances grouped by fraction (the whole experiment). 
+fracmedians = data.H %>%
+  group_by(FRACTION) %>%
+  summarise(median(log2int, na.rm = TRUE))
+colnames(fracmedians) = c("FRACTION", "median_abundance_frac")
+
+#Apply to all proteomes.
+PGdata_long = left_join(PGdata_long, runmedians, by = c("GROUP", "replicate")) %>%
+  left_join(fracmedians, by = "FRACTION") %>%
+  mutate(Normalized_log2int = log2int - median_abundance_run + median_abundance_frac)
+```
+
+Calculate Mix A/Mix B values and then find the average.
+```{r}
+PGdata_4 = pivot_wider(PGdata_long, id_cols = c("Protein", "organism", "GROUP"), names_from = "replicate", values_from = "Normalized_log2int") %>%
+  mutate(mean_log2 = rowMeans(across(c("1", "2", "3", "4")))) 
+
+summary = pivot_wider(PGdata_4, id_cols = c("Protein", "organism"), names_from = "GROUP", values_from = "mean_log2") %>%
+  mutate(log2AB = `MIX-A` - `MIX-B`)
+# write_tsv(summary, "2026may03_file_name_process.tsv")
+```
+
+Prep data for plot.
+```{r}
+# summary = read_tsv("2026may03_file_name_processed.tsv")
+df = summary %>%
+  mutate(Abundance.MixA = 2^`MIX-A`,
+         Abundance.MixB = 2^`MIX-B`,
+         Abundance.Diff = Abundance.MixA/Abundance.MixB) %>%
+  filter(!is.na(Abundance.Diff))
+
+df_h = df %>% filter(organism == "HELA")
+df_e = df %>% filter(organism == "E.COLI")
+df_y = df %>% filter(organism == "YEAST")
+
+#Calculate benchmarks.
+median.abs.H = median(df_h$Abundance.Diff, na.rm = TRUE)
+pcterror.H.median = round((abs(median.abs.H-1)/1)*100, digits = 2)
+sdH = round(sd(df_h$log2AB, na.rm = TRUE), digits = 2)
+
+median.abs.E = median(df_e$Abundance.Diff, na.rm = TRUE)
+pcterror.E.median = round((abs(median.abs.E-0.25)/0.25)*100, digits = 2)
+sdE = round(sd(df_e$log2AB, na.rm = TRUE), digits = 2)
+
+median.abs.Y = median(df_y$Abundance.Diff, na.rm = TRUE)
+pcterror.Y.median = round((abs(median.abs.Y-2)/2)*100, digits = 2)
+sdY = round(sd(df_y$log2AB, na.rm = TRUE), digits = 2)
+```
+
+Make plots.
+```{r}
+library(ggplot2)
+library(patchwork)
+
+#################### scatter plot ####################
+p1 = ggplot(df, aes(x = `MIX-B`, y = log2AB, color = organism)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 14, color = "black"), axis.title = element_text(size = 16), 
+        axis.ticks = element_line(color = "black"), 
+        legend.position = "none",
+        plot.margin = unit(c(1,0,1,1), "cm")) +
+  geom_point(size = 0.7, alpha = 0.3) +
+  scale_color_manual(values = c("#cc6600", "#00b050", "#6699ff")) +
+  scale_y_continuous(limits = c(-3.5,3.2), expand = c(0, 0)) +
+  scale_x_continuous(breaks = seq(8, 24, by = 2)) +
+  # xlim(8,23) +
+  xlab(expression("Log"[2]~"[MixB Protein Abundance]")) +
+  ylab(expression("Log"[2]~"ratio [MixA/MixB]")) +
+  geom_hline(yintercept = 0, linetype = 2, color = "#00b050") + #Human
+  geom_hline(yintercept = -2, linetype = 2, color = "#cc6600") + #E.Coli
+  geom_hline(yintercept = 1, linetype = 2, color = "#6699ff") #Yeast
+
+#################### box plot ####################
+xlabels = c("E", "H", "Y")
+p2 = ggplot(df, aes(x = organism, y = log2AB, fill = organism)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.line = element_line(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"), 
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(), axis.title.x = element_text(size = 16),
+        axis.ticks = element_line(color = "black"),
+        axis.line.y = element_blank(), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 14), 
+        plot.margin = unit(c(1,1,1,0), "cm")) +
+  stat_boxplot(geom = "errorbar", width = 0.15) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("#cc6600", "#00b050", "#6699ff")) +
+  scale_y_continuous(limits = c(-3.5,3.2), expand = c(0, 0)) +
+  ylab(expression("Log"[2]~"ratio [MixA/MixB]")) +
+  scale_x_discrete(labels = xlabels) +
+  geom_hline(yintercept = 0, linetype = 2, color = "#00b050") +
+  geom_hline(yintercept = -2, linetype = 2, color = "#cc6600") +
+  geom_hline(yintercept = 1, linetype = 2, color = "#6699ff")
+
+#################### density plot ####################
+p3 = ggplot(df, aes(y = log2AB, fill = organism, colour = organism)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.line = element_line(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"), axis.text.y = element_blank(), 
+        axis.title.y = element_blank(), axis.title.x = element_text(size = 16, color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.line.y = element_blank(),
+        legend.position = "none",
+        plot.margin = unit(c(1,0.5,1,0.5), "cm")) +
+  geom_density(linewidth = 0.75, alpha = 0.4) +
+  scale_y_continuous(limits = c(-3.5,3.2), expand = c(0, 0)) +
+  scale_x_continuous(breaks = c(0, 1, 2), expand = c(0, 0)) +
+  xlab("density") +
+  scale_fill_manual(values = c(NA, NA, NA)) +
+  scale_color_manual(values = c("#cc6600", "#00b050", "#6699ff")) +
+  geom_hline(yintercept = 0, linetype = 2, color = "#00b050") +
+  geom_hline(yintercept = -2, linetype = 2, color = "#cc6600") +
+  geom_hline(yintercept = 1, linetype = 2, color = "#6699ff")
+
+p4 = p1 + p3 + p2 +
+  plot_layout(widths = c(10,2,2))
+  # plot_annotation(title = "1000 ng Load")
+
+#Manually export png with width = 1500 and height = 650
+```
+
+################################################################################
+FG-level data: Normalize w/ human data, calculate stats, and plot.
+################################################################################
+
+Add species information back to FGdata df.
+```{r}
+# load(file = '2026may03_file_name.rda')
+FGdata = msstats_summarized$FeatureLevelData %>%
+  mutate(PRECURSOR = PEPTIDE,
+         MOD_PEPTIDE = str_split_i(PEPTIDE, "_", 1),
+         Stripped.Sequence = str_replace_all(MOD_PEPTIDE, "(\\[.*?\\])", ""),
+         log2int = ABUNDANCE) %>%
+  select(PROTEIN, Stripped.Sequence, MOD_PEPTIDE, PRECURSOR, GROUP, SUBJECT, RUN, FRACTION, log2int)
+
+#read in line 17 and 29 for "data" df here.
+uniprot.H = data %>% filter(str_detect(PG.Organisms, "Homo sapiens") & !str_detect(PG.Organisms, "Saccharomyces|Escherichia|iRT")) %>%
+  select(PG.Organisms, PG.ProteinGroups) %>% distinct() 
+uniprot.Y = data %>% filter(str_detect(PG.Organisms, "Saccharomyces") & !str_detect(PG.Organisms, "Homo sapiens|Escherichia|iRT")) %>%
+  select(PG.Organisms, PG.ProteinGroups) %>% distinct() 
+uniprot.E = data %>% filter(str_detect(PG.Organisms, "Escherichia") & !str_detect(PG.Organisms, "Homo sapiens|Saccharomyces|iRT")) %>%
+  select(PG.Organisms, PG.ProteinGroups) %>% distinct() 
+
+#Add organism column to fragment group data frame.
+uniprot.H$organism = uniprot.H$PG.Organisms
+uniprot.H$PROTEIN = uniprot.H$PG.ProteinGroups
+uniprot.Y$organism = uniprot.Y$PG.Organisms
+uniprot.Y$PROTEIN = uniprot.Y$PG.ProteinGroups
+uniprot.E$organism = uniprot.E$PG.Organisms
+uniprot.E$PROTEIN = uniprot.E$PG.ProteinGroups
+
+# uniprot = rbind(uniprot.H, uniprot.Y, uniprot.E) %>% select(organism, PROTEIN)
+
+# FGdata_1 = inner_join(FGdata, uniprot, by = c("PROTEIN"))
+  
+FGdata.H = semi_join(FGdata, uniprot.H, by = "PROTEIN")
+FGdata.Y = semi_join(FGdata, uniprot.Y, by = "PROTEIN")
+FGdata.E = semi_join(FGdata, uniprot.E, by = "PROTEIN")
+
+FGdata.H$organism = rep("HELA", times = nrow(FGdata.H))
+FGdata.Y$organism = rep("YEAST", times = nrow(FGdata.Y))
+FGdata.E$organism = rep("E.COLI", times = nrow(FGdata.E))
+
+FGdata_2 = rbind(FGdata.E, FGdata.H, FGdata.Y)
+
+rm(FGdata, FGdata.E, FGdata.H, FGdata.Y)
+```
+
+Calculate FG.CV and filter for ids with 4 reps for quant.
+```{r}
+#Define function for SD across a row.
+rowSDs <- function(x, num_of_measurements) {
+  sqrt(rowSums((x - rowMeans(x, na.rm = TRUE))^2, na.rm = TRUE)/(num_of_measurements - 1))
+}
+
+FGdata_3 = pivot_wider(FGdata_2, id_cols = c("PRECURSOR", "PROTEIN", "organism", "GROUP", "FRACTION"), 
+                       names_from = "SUBJECT", values_from = "log2int") %>%
+  mutate(abundance_1 = 2^`1`,
+         abundance_2 = 2^`2`,
+         abundance_3 = 2^`3`, 
+         abundance_4 = 2^`4`,
+         num_of_measurements = rowSums(!is.na(across(c("1", "2", "3", "4"))))) %>%
+  #Calculate CV for abundance values (not log) of each FG (allows NA).
+  mutate(FG.CV = (rowSDs(across(c("abundance_1", "abundance_2", "abundance_3", "abundance_4")), num_of_measurements)/rowMeans(across(c("abundance_1", "abundance_2", "abundance_3", "abundance_4")), na.rm = TRUE))*100) %>%
+  mutate(use_for_plots = num_of_measurements == 4)
+
+rm(FGdata_2)
+
+FGdata_long = FGdata_3 %>% 
+  filter(use_for_plots) %>% #now will only plot FGs with complete data (4/4 reps)
+  select(PRECURSOR, PROTEIN, organism, GROUP, FRACTION, num_of_measurements, FG.CV, `1`, `2`, `3`, `4`) %>%
+  pivot_longer(cols = -c("PRECURSOR", "PROTEIN", "organism", "GROUP", "FRACTION", "num_of_measurements", "FG.CV"), 
+                              names_to = "replicate", values_to = "log2int")
+```
+
+Calculate normalization for human data and apply to other proteomes.
+```{r}
+data.H = FGdata_long %>% filter(organism == "HELA")
+
+#Calculate median of abundances grouped by run.
+runmedians = data.H %>% 
+  group_by(GROUP, replicate) %>%
+  summarise(median(log2int, na.rm = TRUE))
+colnames(runmedians) = c("GROUP", "replicate", "median_abundance_run")
+
+#Calculate median of abundances grouped by fraction (the whole experiment). 
+fracmedians = data.H %>%
+  group_by(FRACTION) %>%
+  summarise(median(log2int, na.rm = TRUE))
+colnames(fracmedians) = c("FRACTION", "median_abundance_frac")
+
+#Apply to all proteomes.
+FGdata_long = left_join(FGdata_long, runmedians, by = c("GROUP", "replicate")) %>%
+  left_join(fracmedians, by = "FRACTION") %>%
+  mutate(Normalized_log2int = log2int - median_abundance_run + median_abundance_frac)
+```
+
+Calculate Mix A/Mix B values and then find the average.
+```{r}
+FGdata_4 = pivot_wider(FGdata_long, id_cols = c("PRECURSOR", "PROTEIN", "organism", "GROUP"), names_from = "replicate", values_from = "Normalized_log2int") %>% 
+  mutate(mean_log2 = rowMeans(across(c("1", "2", "3", "4")))) 
+
+summary = pivot_wider(FGdata_4, id_cols = c("PRECURSOR", "PROTEIN", "organism"), names_from = "GROUP", values_from = "mean_log2") %>%
+  mutate(log2AB = `MIX-A` - `MIX-B`)
+# write_tsv(summary, "2026may03_file_name_processed_FGs.tsv")
+```
+
+Prep data for plot.
+```{r}
+# summary = read_tsv("2026may03_file_name_processed_FGs.tsv")
+df = summary %>%
+  mutate(Abundance.MixA = 2^`MIX-A`,
+         Abundance.MixB = 2^`MIX-B`,
+         Abundance.Diff = Abundance.MixA/Abundance.MixB) %>%
+  filter(!is.na(Abundance.Diff))
+
+df_h = df %>% filter(organism == "HELA")
+df_e = df %>% filter(organism == "E.COLI")
+df_y = df %>% filter(organism == "YEAST")
+
+#Calculate benchmarks.
+median.abs.H = median(df_h$Abundance.Diff, na.rm = TRUE)
+pcterror.H.median = round((abs(median.abs.H-1)/1)*100, digits = 2)
+sdH = round(sd(df_h$log2AB, na.rm = TRUE), digits = 2)
+
+median.abs.E = median(df_e$Abundance.Diff, na.rm = TRUE)
+pcterror.E.median = round((abs(median.abs.E-0.25)/0.25)*100, digits = 2)
+sdE = round(sd(df_e$log2AB, na.rm = TRUE), digits = 2)
+
+median.abs.Y = median(df_y$Abundance.Diff, na.rm = TRUE)
+pcterror.Y.median = round((abs(median.abs.Y-2)/2)*100, digits = 2)
+sdY = round(sd(df_y$log2AB, na.rm = TRUE), digits = 2)
+```
+
+Make plots.
+```{r}
+library(ggplot2)
+library(patchwork)
+
+#################### scatter plot ####################
+p1 = ggplot(df, aes(x = `MIX-B`, y = log2AB, color = organism)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 14, color = "black"), axis.title = element_text(size = 16), 
+        axis.ticks = element_line(color = "black"), 
+        legend.position = "none",
+        plot.margin = unit(c(1,0,1,1), "cm")) +
+  geom_point(size = 0.7, alpha = 0.3) +
+  scale_color_manual(values = c("#cc6600", "#00b050", "#6699ff")) +
+  scale_y_continuous(limits = c(-4.6,6), expand = c(0, 0)) +
+  scale_x_continuous(breaks = seq(6, 24, by = 2)) +
+  # xlim(8,23) +
+  xlab(expression("Log"[2]~"[MixB Protein Abundance]")) +
+  ylab(expression("Log"[2]~"ratio [MixA/MixB]")) +
+  geom_hline(yintercept = 0, linetype = 2, color = "#00b050") + #Human
+  geom_hline(yintercept = -2, linetype = 2, color = "#cc6600") + #E.Coli
+  geom_hline(yintercept = 1, linetype = 2, color = "#6699ff") #Yeast
+
+#################### box plot ####################
+xlabels = c("E", "H", "Y")
+p2 = ggplot(df, aes(x = organism, y = log2AB, fill = organism)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.line = element_line(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"), 
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(), axis.title.x = element_text(size = 16),
+        axis.ticks = element_line(color = "black"),
+        axis.line.y = element_blank(), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 14), 
+        plot.margin = unit(c(1,1,1,0), "cm")) +
+  stat_boxplot(geom = "errorbar", width = 0.15) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("#cc6600", "#00b050", "#6699ff")) +
+  scale_y_continuous(limits = c(-4.6,6), expand = c(0, 0)) +
+  ylab(expression("Log"[2]~"ratio [MixA/MixB]")) +
+  scale_x_discrete(labels = xlabels) +
+  geom_hline(yintercept = 0, linetype = 2, color = "#00b050") +
+  geom_hline(yintercept = -2, linetype = 2, color = "#cc6600") +
+  geom_hline(yintercept = 1, linetype = 2, color = "#6699ff")
+
+#################### density plot ####################
+p3 = ggplot(df, aes(y = log2AB, fill = organism, colour = organism)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        axis.line = element_line(color = "black"),
+        axis.text.x = element_text(size = 14, color = "black"), axis.text.y = element_blank(), 
+        axis.title.y = element_blank(), axis.title.x = element_text(size = 16, color = "black"),
+        axis.ticks = element_line(color = "black"),
+        axis.line.y = element_blank(),
+        legend.position = "none",
+        plot.margin = unit(c(1,0.5,1,0.5), "cm")) +
+  geom_density(linewidth = 0.75, alpha = 0.4) +
+  scale_y_continuous(limits = c(-4.6,6), expand = c(0, 0)) +
+  scale_x_continuous(breaks = c(0, 1, 2), expand = c(0, 0)) +
+  xlab("density") +
+  scale_fill_manual(values = c(NA, NA, NA)) +
+  scale_color_manual(values = c("#cc6600", "#00b050", "#6699ff")) +
+  geom_hline(yintercept = 0, linetype = 2, color = "#00b050") +
+  geom_hline(yintercept = -2, linetype = 2, color = "#cc6600") +
+  geom_hline(yintercept = 1, linetype = 2, color = "#6699ff")
+
+p4 = p1 + p3 + p2 +
+  plot_layout(widths = c(10,2,2))
+  # plot_annotation(title = "1000 ng Load")
+
+#Manually export png with width = 1500 and height = 650
+```
+
+################################################################################
+Creat double S curves for Mix A & Mix B precursors.
+################################################################################
+
+Add rank order (based on Mix B log2int) to FG df.
+```{r}
+library(matrixStats)
+library(forcats)
+library(forecast)
+
+#Add rank order to E.COLI. 
+FGdata_E.mixa = FGdata_4 %>% 
+  filter(organism == "E.COLI") %>%
+  filter(GROUP == "MIX-A") %>%
+  select(PRECURSOR, PROTEIN, organism, GROUP, mean_log2)
+FGdata_E.mixb = FGdata_4 %>% 
+  filter(organism == "E.COLI") %>%
+  filter(GROUP == "MIX-B") %>%
+  select(PRECURSOR, PROTEIN, organism, GROUP, mean_log2)
+
+FGdata.E = full_join(FGdata_E.mixa, FGdata_E.mixb, by = c("PRECURSOR", "PROTEIN", "organism"), 
+                     suffix = c(".MIX-A", ".MIX-B")) %>%
+  filter(!is.na(`mean_log2.MIX-A`) & !is.na(`mean_log2.MIX-B`)) %>%  #Only plot Ids found in both mix A and mix B.
+  arrange(desc(`mean_log2.MIX-B`)) %>%
+  mutate(SMA.A = TTR::SMA(`mean_log2.MIX-A`, n = 150)) %>%
+  mutate(SMA.B = TTR::SMA(`mean_log2.MIX-B`, n = 150)) %>%
+  mutate(SMA.diffAB = SMA.A - SMA.B)
+FGdata.E$Rank.Order = seq(1, nrow(FGdata.E), by = 1)
+
+#Add rank order to HELA. 
+FGdata_H.mixa = FGdata_4 %>% 
+  filter(organism == "HELA") %>%
+  filter(GROUP == "MIX-A") %>%
+  select(PRECURSOR, PROTEIN, organism, GROUP, mean_log2)
+FGdata_H.mixb = FGdata_4 %>% 
+  filter(organism == "HELA") %>%
+  filter(GROUP == "MIX-B") %>%
+  select(PRECURSOR, PROTEIN, organism, GROUP, mean_log2)
+
+FGdata.H = full_join(FGdata_H.mixa, FGdata_H.mixb, by = c("PRECURSOR", "PROTEIN", "organism"), 
+                     suffix = c(".MIX-A", ".MIX-B")) %>%
+  filter(!is.na(`mean_log2.MIX-A`) & !is.na(`mean_log2.MIX-B`)) %>%  #Only plot Ids found in both mix A and mix B.
+  arrange(desc(`mean_log2.MIX-B`)) %>%
+  mutate(SMA.A = TTR::SMA(`mean_log2.MIX-A`, n = 150)) %>%
+  mutate(SMA.B = TTR::SMA(`mean_log2.MIX-B`, n = 150)) %>%
+  mutate(SMA.diffAB = SMA.A - SMA.B)
+FGdata.H$Rank.Order = seq(1, nrow(FGdata.H), by = 1)
+
+#Add rank order to YEAST. 
+FGdata_Y.mixa = FGdata_4 %>% 
+  filter(organism == "YEAST") %>%
+  filter(GROUP == "MIX-A") %>%
+  select(PRECURSOR, PROTEIN, organism, GROUP, mean_log2)
+FGdata_Y.mixb = FGdata_4 %>% 
+  filter(organism == "YEAST") %>%
+  filter(GROUP == "MIX-B") %>%
+  select(PRECURSOR, PROTEIN, organism, GROUP, mean_log2)
+
+FGdata.Y = full_join(FGdata_Y.mixa, FGdata_Y.mixb, by = c("PRECURSOR", "PROTEIN", "organism"), 
+                     suffix = c(".MIX-A", ".MIX-B")) %>%
+  filter(!is.na(`mean_log2.MIX-A`) & !is.na(`mean_log2.MIX-B`)) %>%  #Only plot Ids found in both mix A and mix B.
+  arrange(desc(`mean_log2.MIX-B`)) %>%
+  mutate(SMA.A = TTR::SMA(`mean_log2.MIX-A`, n = 150)) %>%
+  mutate(SMA.B = TTR::SMA(`mean_log2.MIX-B`, n = 150)) %>%
+  mutate(SMA.diffAB = SMA.A - SMA.B)
+FGdata.Y$Rank.Order = seq(1, nrow(FGdata.Y), by = 1)
+
+rm(FGdata_E.mixa, FGdata_E.mixb, FGdata_H.mixa, FGdata_H.mixb, FGdata_Y.mixa, FGdata_Y.mixb)
+
+#Combine species dfs and add R.Condition column back.
+FGdata_HYE = rbind(FGdata.H, FGdata.Y, FGdata.E) %>%
+  select(organism, PRECURSOR, Rank.Order, contains("SMA"), contains("mean_log2"))
+
+FGdata_mixa = FGdata_HYE %>%
+  select(organism, PRECURSOR, Rank.Order, contains("SMA"), contains("MIX-A"))
+colnames(FGdata_mixa)[7] = "mean"
+FGdata_mixa$GROUP = rep("MIX-A", times = nrow(FGdata_mixa))
+
+FGdata_mixb = FGdata_HYE %>%
+  select(organism, PRECURSOR, Rank.Order, contains("SMA"), contains("MIX-B"))
+colnames(FGdata_mixb)[7] = "mean"
+FGdata_mixb$GROUP = rep("MIX-B", times = nrow(FGdata_mixb))
+
+msdata.ranks = rbind(FGdata_mixa, FGdata_mixb)
+
+rm(FGdata.E, FGdata.H, FGdata.Y, FGdata_mixa, FGdata_mixb)
+```
+
+Make double S curves for E. Coli.
+```{r}
+data = msdata.ranks %>% 
+              filter(organism == "E.COLI") %>%
+              mutate(
+                GROUP = fct_relevel(GROUP, "MIX-A", "MIX-B"),
+                .draw_order = factor(GROUP, levels = c("MIX-A", "MIX-B"))) %>% #Ensure first level is plotted on top.
+              arrange(.draw_order)
+
+p1.a = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,1,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_point(size = 0.5) + 
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(7,25), expand = c(0,0)) +
+  scale_color_manual(values = c("#e16462", "#7e03a8")) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Mean Log"[2]~"MS1 FG Int.")) + 
+  ggtitle("E. Coli")
+
+p1.b = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,1,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_line(aes(y = SMA.A, color = "MIX-A"), linewidth = 1) + 
+  geom_line(aes(y = SMA.B, color = "MIX-B"), linewidth = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(10,25), expand = c(0,0)) +
+  scale_color_manual(name = NULL, values = c("MIX-A" = "#e16462", "MIX-B" = "#7e03a8")) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Simple Moving Avg."))
+
+p1.c = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,0,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_hline(aes(yintercept = -2, linetype = "Expected Difference"), color = "black", size = 1) +
+  geom_line(aes(y = SMA.diffAB, color = "Measured Difference"), size = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_color_manual(name = NULL, values = c("Measured Difference" = "#cc6600")) +
+  scale_linetype_manual(name = NULL, values = c("Expected Difference" = "solid")) +
+  guides(color = guide_legend(override.aes = list(size = 3)),
+         linetype = guide_legend(order = 2)) +
+  ylim(-3,-1) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Log"[2]~"Ratio [MixA/MixB]"))
+
+pE = p1.a / p1.b / p1.c + plot_layout(guides = "keep")
+#Export with width 1500 and height 900
+```
+
+Make double S curves for HeLa.
+```{r}
+data = msdata.ranks %>% 
+              filter(organism == "HELA") %>%
+              mutate(
+                GROUP = fct_relevel(GROUP, "MIX-A", "MIX-B"),
+                .draw_order = factor(GROUP, levels = c("MIX-A", "MIX-B"))) %>% #Ensure first level is plotted on top.
+              arrange(.draw_order)
+
+p1.a = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,1,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_point(size = 0.5) + 
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(6,24), expand = c(0,0)) +
+  scale_color_manual(values = c("#e16462", "#7e03a8")) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Mean Log"[2]~"MS1 FG Int.")) + 
+  ggtitle("HeLa")
+
+p1.b = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,1,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_line(aes(y = SMA.A, color = "MIX-A"), linewidth = 1) + 
+  geom_line(aes(y = SMA.B, color = "MIX-B"), linewidth = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(10,22), expand = c(0,0)) +
+  scale_color_manual(name = NULL, values = c("MIX-A" = "#e16462", "MIX-B" = "#7e03a8")) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Simple Moving Avg."))
+
+p1.c = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,0,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_hline(aes(yintercept = 0, linetype = "Expected Difference"), color = "black", size = 1) +
+  geom_line(aes(y = SMA.diffAB, color = "Measured Difference"), size = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_color_manual(name = NULL, values = c("Measured Difference" = "#00b050")) +
+  scale_linetype_manual(name = NULL, values = c("Expected Difference" = "solid")) +
+  guides(color = guide_legend(override.aes = list(size = 3)),
+         linetype = guide_legend(order = 2)) +
+  ylim(-1,1) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Log"[2]~"Ratio [MixA/MixB]"))
+
+pH = p1.a / p1.b / p1.c + plot_layout(guides = "keep")
+#Export with width 1500 and height 900
+```
+
+Make double S curves for Yeast.
+```{r}
+data = msdata.ranks %>% 
+              filter(organism == "YEAST") %>%
+              mutate(
+                GROUP = fct_relevel(GROUP, "MIX-A", "MIX-B"),
+                .draw_order = factor(GROUP, levels = c("MIX-B", "MIX-A"))) %>% #Second level is plotted on top.
+              arrange(.draw_order)
+
+p1.a = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,1,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_point(size = 0.5) + 
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(6,24), expand = c(0,0)) +
+  scale_color_manual(values = c("#e16462", "#7e03a8")) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Mean Log"[2]~"MS1 FG Int.")) + 
+  ggtitle("Yeast")
+
+p1.b = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,1,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_line(aes(y = SMA.A, color = "MIX-A"), linewidth = 1) + 
+  geom_line(aes(y = SMA.B, color = "MIX-B"), linewidth = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(limits = c(10,22), expand = c(0,0)) +
+  scale_color_manual(name = NULL, values = c("MIX-A" = "#e16462", "MIX-B" = "#7e03a8")) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Simple Moving Avg."))
+
+p1.c = ggplot(data, aes(x = Rank.Order, y = mean, color = GROUP)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(color = "black"),
+        axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 15),
+        axis.ticks = element_line(color = "darkgray"), 
+        legend.title = element_text(size = 16), legend.text = element_text(size = 15),
+        plot.margin = unit(c(1,0,0,0), "cm"),
+        plot.title = element_text(size = 20)) +
+  geom_hline(aes(yintercept = 1, linetype = "Expected Difference"), color = "black", size = 1) +
+  geom_line(aes(y = SMA.diffAB, color = "Measured Difference"), size = 1) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_color_manual(name = NULL, values = c("Measured Difference" = "#6699ff")) +
+  scale_linetype_manual(name = NULL, values = c("Expected Difference" = "solid")) +
+  guides(color = guide_legend(override.aes = list(size = 3)),
+         linetype = guide_legend(order = 2)) +
+  ylim(0,2) +
+  xlab(expression("Rank Order of Precursors in Mix B")) +
+  ylab(expression("Log"[2]~"Ratio [MixA/MixB]"))
+
+pY = p1.a / p1.b / p1.c + plot_layout(guides = "keep")
+#Export with width 1500 and height 900
+```
+
+################################################################################
+Set up HYE file to help calculate protein sequence coverage.
+################################################################################
+
+```{r}
+reformat_fasta <- function(input, output) {
+  lines <- readLines(input)
+  
+  df <- tibble(line = lines) %>%
+    mutate(is_header = str_starts(line, ">"),
+           group = cumsum(is_header))
+  
+  fasta <- df %>%
+    group_by(group) %>%
+    summarise(
+      header = first(line[is_header]),
+      sequence = paste0(line[!is_header], collapse = ""),
+      .groups = "drop"
+    )
+  
+  out <- as.vector(rbind(fasta$header, fasta$sequence))
+  writeLines(out, output)
+}
+
+test = reformat_fasta("C:/Users/isabel.uribe/Documents/HYE_R-analysis/HeLa_with_iRT.fasta", "C:/Users/isabel.uribe/Documents/HYE_R-analysis/HeLa_with_iRT_oneline.fasta")
+
+#Format fasta files into prot accession, sequence, and organism
+hela_fasta = read_tsv("HeLa_with_iRT_oneline.fasta", col_names = FALSE)
+hela_fasta_ids = hela_fasta %>% filter(str_detect(`X1`, ">"))
+hela_fasta_seq = hela_fasta %>% filter(!str_detect(`X1`, ">"))
+hela_prot = data.frame(PROTEIN = str_split_i(hela_fasta_ids$X1, "\\|", 2),
+                       Protein.Sequence = hela_fasta_seq$X1,
+                       organism = rep("HELA"))
+
+yeast_fasta = read_tsv("Yeast_oneline.fasta", col_names = FALSE)
+yeast_fasta_ids = yeast_fasta %>% filter(str_detect(`X1`, ">"))
+yeast_fasta_seq = yeast_fasta %>% filter(!str_detect(`X1`, ">"))
+yeast_prot = data.frame(PROTEIN = str_split_i(yeast_fasta_ids$X1, "\\|", 2),
+                       Protein.Sequence = yeast_fasta_seq$X1,
+                       organism = rep("YEAST"))
+
+e.coli_fasta = read_tsv("DH5alpha_E.coli_oneline.fasta", col_names = FALSE)
+e.coli_fasta_ids = e.coli_fasta %>% filter(str_detect(`X1`, ">"))
+e.coli_fasta_seq = e.coli_fasta %>% filter(!str_detect(`X1`, ">"))
+e.coli_prot = data.frame(PROTEIN = str_split_i(e.coli_fasta_ids$X1, "\\|", 2),
+                       Protein.Sequence = e.coli_fasta_seq$X1,
+                       organism = rep("E.COLI"))
+
+HYE_prot = rbind(hela_prot, yeast_prot, e.coli_prot)
+write.csv(HYE_prot, "HYE_protein_sequences.csv")
+```
